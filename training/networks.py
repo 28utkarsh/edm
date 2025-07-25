@@ -629,6 +629,76 @@ class iDDPMPrecond(torch.nn.Module):
 # Space of Diffusion-Based Generative Models" (EDM).
 
 @persistence.persistent_class
+class MLPPrecond(torch.nn.Module):
+    def __init__(self,
+        img_resolution=2,                   # Dimensionality of the input (2 for 2D points).
+        img_channels=1,                     # Number of channels (1 for 2D points).
+        label_dim=0,                        # Number of class labels, 0 = unconditional.
+        use_fp16=False,                     # Execute the model at FP16 precision?
+        sigma_min=0,                        # Minimum supported noise level.
+        sigma_max=float('inf'),             # Maximum supported noise level.
+        sigma_data=0.5,                     # Expected standard deviation of the training data.
+        hidden_channels=128,                # Number of hidden channels in the MLP.
+        num_layers=4,                       # Number of hidden layers in the MLP.
+        **super_kwargs,                # Additional keyword arguments for the MLP.
+    ):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.label_dim = label_dim
+        self.use_fp16 = use_fp16
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.sigma_data = sigma_data
+
+        # MLP architecture
+        layers = []
+        in_features = img_channels * img_resolution + hidden_channels  # Input: x (2) + embedding (hidden_channels)
+        for i in range(num_layers):
+            out_features = hidden_channels if i < num_layers - 1 else img_channels * img_resolution
+            layers.append(Linear(in_features=in_features, out_features=out_features))
+            if i < num_layers - 1:
+                layers.append(torch.nn.ReLU())
+            in_features = out_features
+        self.mlp = torch.nn.Sequential(*layers)
+
+        # Noise embedding
+        self.map_noise = PositionalEmbedding(num_channels=hidden_channels)
+        self.map_layer = Linear(in_features=hidden_channels, out_features=hidden_channels)
+
+    def forward(self, x, sigma, class_labels=None, force_fp32=False, **model_kwargs):
+        x = x.to(torch.float32)
+        sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)  # Match input shape [batch, 1, 1, 1]
+        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
+        dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+
+        # EDM preconditioning
+        c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)  # [batch, 1, 1, 1]
+        c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()  # [batch, 1, 1, 1]
+        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()  # [batch, 1, 1, 1]
+        c_noise = sigma.log() / 4  # [batch, 1, 1, 1]
+
+        # Reshape input: [batch, 1, 2, 1] -> [batch, 2]
+        x = x.squeeze(-1).view(x.size(0), -1).to(dtype)  # [batch, 2]
+
+        # Noise embedding
+        emb = self.map_noise(c_noise.flatten())  # [batch, hidden_channels]
+        emb = silu(self.map_layer(emb))  # [batch, hidden_channels]
+
+        # Concatenate input and embedding
+        x = torch.cat([x, emb], dim=1)  # [batch, 2 + hidden_channels]
+
+        # Process through MLP
+        x = self.mlp(x).to(torch.float32)  # [batch, 2]
+
+        # Apply preconditioning
+        D_x = c_skip.squeeze().unsqueeze(-1) * x + c_out.squeeze().unsqueeze(-1) * x  # [batch, 2]
+        return D_x.view(-1, self.img_channels, self.img_resolution, 1)  # [batch, 1, 2, 1]
+
+    def round_sigma(self, sigma):
+        return torch.as_tensor(sigma)
+
+@persistence.persistent_class
 class EDMPrecond(torch.nn.Module):
     def __init__(self,
         img_resolution,                     # Image resolution.

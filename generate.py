@@ -1,3 +1,12 @@
+"""
+torchrun --standalone --nproc_per_node=1 generate.py \
+    --outdir=generated-samples \
+    --network=training-runs/00023-swissroll-uncond-ddpmpp-edm-gpus1-batch2048-fp32/network-snapshot-002000.pkl \
+    --seeds=0-999 \
+    --batch=1000 \
+    --steps=40 \
+    --dataset-type=swissroll
+"""
 # Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # This work is licensed under a Creative Commons
@@ -5,7 +14,7 @@
 # You should have received a copy of the license along with this
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
-"""Generate random images using the techniques described in the paper
+"""Generate random 2D point cloud samples using the techniques described in the paper
 "Elucidating the Design Space of Diffusion-Based Generative Models"."""
 
 import os
@@ -15,9 +24,9 @@ import tqdm
 import pickle
 import numpy as np
 import torch
-import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
+import matplotlib.pyplot as plt
 
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
@@ -47,21 +56,20 @@ def edm_sampler(
         x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
 
         # Euler step.
-        denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
+        denoised = net(x_hat, t_hat.view(1, 1, 1, 1).repeat(x_hat.shape[0], 1, 1, 1), class_labels).to(torch.float64)
         d_cur = (x_hat - denoised) / t_hat
         x_next = x_hat + (t_next - t_hat) * d_cur
 
         # Apply 2nd order correction.
         if i < num_steps - 1:
-            denoised = net(x_next, t_next, class_labels).to(torch.float64)
+            denoised = net(x_next, t_next.view(1, 1, 1, 1).repeat(x_next.shape[0], 1, 1, 1), class_labels).to(torch.float64)
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
     return x_next
 
 #----------------------------------------------------------------------------
-# Generalized ablation sampler, representing the superset of all sampling
-# methods discussed in the paper.
+# Generalized ablation sampler.
 
 def ablation_sampler(
     net, latents, class_labels=None, randn_like=torch.randn_like,
@@ -215,13 +223,12 @@ def parse_int_list(s):
 
 @click.command()
 @click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
-@click.option('--outdir',                  help='Where to save the output images', metavar='DIR',                   type=str, required=True)
-@click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-63', show_default=True)
+@click.option('--outdir',                  help='Where to save the output samples', metavar='DIR',                   type=str, required=True)
+@click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-999', show_default=True)
 @click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
 @click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
-@click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
-
-@click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
+@click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=1000, show_default=True)
+@click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=40, show_default=True)
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
 @click.option('--sigma_max',               help='Highest noise level  [default: varies]', metavar='FLOAT',          type=click.FloatRange(min=0, min_open=True))
 @click.option('--rho',                     help='Time step exponent', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=7, show_default=True)
@@ -229,29 +236,27 @@ def parse_int_list(s):
 @click.option('--S_min', 'S_min',          help='Stoch. min noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default=0, show_default=True)
 @click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
 @click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
-
 @click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun',                          type=click.Choice(['euler', 'heun']))
 @click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
+@click.option('--dataset-type',            help='Custom dataset type (swissroll|checkerboard|ngaussian)', type=click.Choice(['swissroll', 'checkerboard', 'ngaussian']), default='swissroll', show_default=True)
 
-def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
-    """Generate random images using the techniques described in the paper
+def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, dataset_type, **sampler_kwargs):
+    """Generate random 2D point cloud samples using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
     Examples:
 
     \b
-    # Generate 64 images and save them as out/*.png
-    python generate.py --outdir=out --seeds=0-63 --batch=64 \\
-        --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
-
-    \b
-    # Generate 1024 images using 2 GPUs
-    torchrun --standalone --nproc_per_node=2 generate.py --outdir=out --seeds=0-999 --batch=64 \\
-        --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+    # Generate 1000 points for SwissRoll dataset
+    torchrun --standalone --nproc_per_node=8 generate.py --outdir=generated-samples \\
+        --network=training-runs/00001-swissroll-uncond-ddpmpp-edm-gpus8-batch512-fp32/network-snapshot-002000.pkl \\
+        --seeds=0-999 --batch=1000 --steps=40 --dataset-type=swissroll
     """
     dist.init()
+    device = torch.device('cuda')
+
     num_batches = ((len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1) * dist.get_world_size()
     all_batches = torch.as_tensor(seeds).tensor_split(num_batches)
     rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
@@ -270,7 +275,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
         torch.distributed.barrier()
 
     # Loop over batches.
-    dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
+    dist.print0(f'Generating {len(seeds)} samples to "{outdir}"...')
     for batch_seeds in tqdm.tqdm(rank_batches, unit='batch', disable=(dist.get_rank() != 0)):
         torch.distributed.barrier()
         batch_size = len(batch_seeds)
@@ -279,7 +284,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
 
         # Pick latents and labels.
         rnd = StackedRandomGenerator(device, batch_seeds)
-        latents = rnd.randn([batch_size, net.img_channels, net.img_resolution, net.img_resolution], device=device)
+        latents = rnd.randn([batch_size, net.img_channels, net.img_resolution, 1], device=device)  # [batch, 1, 2, 1]
         class_labels = None
         if net.label_dim:
             class_labels = torch.eye(net.label_dim, device=device)[rnd.randint(net.label_dim, size=[batch_size], device=device)]
@@ -287,22 +292,28 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
             class_labels[:, :] = 0
             class_labels[:, class_idx] = 1
 
-        # Generate images.
+        # Generate samples.
         sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
         have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
         sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-        images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
+        samples = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
 
-        # Save images.
-        images_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
-        for seed, image_np in zip(batch_seeds, images_np):
-            image_dir = os.path.join(outdir, f'{seed-seed%1000:06d}') if subdirs else outdir
-            os.makedirs(image_dir, exist_ok=True)
-            image_path = os.path.join(image_dir, f'{seed:06d}.png')
-            if image_np.shape[2] == 1:
-                PIL.Image.fromarray(image_np[:, :, 0], 'L').save(image_path)
-            else:
-                PIL.Image.fromarray(image_np, 'RGB').save(image_path)
+        # Save samples as NumPy arrays.
+        samples_np = samples.to(torch.float32).cpu().numpy()  # [batch, 1, 2, 1]
+        if dist.get_rank() == 0:
+            output_dir = os.path.join(outdir, f'{batch_seeds[0]-batch_seeds[0]%1000:06d}') if subdirs else outdir
+            os.makedirs(output_dir, exist_ok=True)
+            np.save(os.path.join(output_dir, f'samples_{batch_seeds[0]}-{batch_seeds[-1]}.npy'), samples_np)
+
+            # Optional: Visualize as scatter plot.
+            points = samples_np.squeeze(1).squeeze(-1)  # [batch, 2]
+            plt.figure(figsize=(8, 8))
+            plt.scatter(points[:, 0], points[:, 1], s=1)
+            plt.title(f'{dataset_type} Samples (Seeds {batch_seeds[0]}-{batch_seeds[-1]})')
+            plt.xlabel('X')
+            plt.ylabel('Y')
+            plt.savefig(os.path.join(output_dir, f'samples_{batch_seeds[0]}-{batch_seeds[-1]}.png'))
+            plt.close()
 
     # Done.
     torch.distributed.barrier()
@@ -312,5 +323,3 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
 
 if __name__ == "__main__":
     main()
-
-#----------------------------------------------------------------------------

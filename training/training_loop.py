@@ -72,11 +72,17 @@ def training_loop(
     # Construct network.
     dist.print0('Constructing network...')
     interface_kwargs = dict(img_resolution=dataset_obj.resolution, img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim)
+    if dataset_obj.name in ['swissroll', 'checkerboard', 'ngaussian']:
+        interface_kwargs['img_channels'] = 1  # Single channel for 2D points
+        interface_kwargs['img_resolution'] = 2  # 2D coordinates
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
     net.train().requires_grad_(True).to(device)
     if dist.get_rank() == 0:
         with torch.no_grad():
-            images = torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution], device=device)
+            if dataset_obj.name in ['swissroll', 'checkerboard', 'ngaussian']:
+                images = torch.zeros([batch_gpu, net.img_channels, net.img_resolution, 1], device=device) # Shape [batch, 1, 2, 1] for 2D points
+            else:
+                images = torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution], device=device)
             sigma = torch.ones([batch_gpu], device=device)
             labels = torch.zeros([batch_gpu, net.label_dim], device=device)
             misc.print_module_summary(net, [images, sigma, labels], max_nesting=2)
@@ -125,7 +131,9 @@ def training_loop(
         for round_idx in range(num_accumulation_rounds):
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
-                images = images.to(device).to(torch.float32) / 127.5 - 1
+                images = images.to(device).to(torch.float32)
+                if dataset_obj.name not in ['swissroll', 'checkerboard', 'ngaussian']:
+                    images = images / 127.5 - 1
                 labels = labels.to(device)
                 loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
                 training_stats.report('Loss/loss', loss)

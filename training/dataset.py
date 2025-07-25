@@ -14,6 +14,7 @@ import PIL.Image
 import json
 import torch
 import dnnlib
+import sklearn.datasets
 
 try:
     import pyspng
@@ -96,10 +97,10 @@ class Dataset(torch.utils.data.Dataset):
                 self._cached_images[raw_idx] = image
         assert isinstance(image, np.ndarray)
         assert list(image.shape) == self.image_shape
-        assert image.dtype == np.uint8
+        assert image.dtype in [np.uint8, np.float32]  # Allow float32 for custom datasets
         if self._xflip[idx]:
-            assert image.ndim == 3 # CHW
-            image = image[:, :, ::-1]
+            assert image.ndim == 3 or image.ndim == 4  # CHW or CHW1
+            image = image[..., ::-1] if image.ndim == 3 else image[..., ::-1, :]
         return image.copy(), self.get_label(idx)
 
     def get_label(self, idx):
@@ -127,13 +128,13 @@ class Dataset(torch.utils.data.Dataset):
 
     @property
     def num_channels(self):
-        assert len(self.image_shape) == 3 # CHW
+        assert len(self.image_shape) in [3, 4]  # CHW or CHW1
         return self.image_shape[0]
 
     @property
     def resolution(self):
-        assert len(self.image_shape) == 3 # CHW
-        assert self.image_shape[1] == self.image_shape[2]
+        assert len(self.image_shape) in [3, 4]  # CHW or CHW1
+        assert self.image_shape[1] == self.image_shape[2] or self.image_shape[2] == 1
         return self.image_shape[1]
 
     @property
@@ -166,7 +167,6 @@ class Dataset(torch.utils.data.Dataset):
 class ImageFolderDataset(Dataset):
     def __init__(self,
         path,                   # Path to directory or zip.
-        resolution      = None, # Ensure specific resolution, None = highest available.
         use_pyspng      = True, # Use pyspng if available?
         **super_kwargs,         # Additional arguments for the Dataset base class.
     ):
@@ -190,8 +190,6 @@ class ImageFolderDataset(Dataset):
 
         name = os.path.splitext(os.path.basename(self._path))[0]
         raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
-        if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
-            raise IOError('Image files do not match the specified resolution')
         super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
 
     @staticmethod
@@ -248,3 +246,74 @@ class ImageFolderDataset(Dataset):
         return labels
 
 #----------------------------------------------------------------------------
+# Dataset subclass for 2D point cloud datasets (SwissRoll, CheckerBoard, NGaussianMixtures).
+
+class Custom2DDataset(Dataset):
+    def __init__(self,
+        path,                   # Path identifier (e.g., 'custom:swissroll'), ignored for data storage.
+        resolution=2,           # Resolution of the dataset (not used here, but kept for compatibility).
+        max_size=None,          # Artificially limit the size of the dataset. None = no limit.
+        dataset_type='swissroll',  # Type of dataset: 'swissroll', 'checkerboard', or 'ngaussian'.
+        n_samples=8000,         # Number of samples for the dataset.
+        num_mixture=8,          # Number of mixtures for NGaussianMixtures.
+        radius=8.0,             # Radius for NGaussianMixtures.
+        sigma=1.0,              # Sigma for NGaussianMixtures.
+        use_labels=False,       # Enable conditioning labels? False = no labels.
+        xflip=False,            # Artificially double the dataset via x-flips.
+        random_seed=0,          # Random seed for max_size.
+        cache=True,             # Cache data in CPU memory?
+    ):
+        self._dataset_type = dataset_type
+        name = dataset_type
+        self._data = None
+
+        # Initialize the appropriate dataset
+        if dataset_type == 'swissroll':
+            data = sklearn.datasets.make_swiss_roll(n_samples=n_samples, noise=1.0)[0]
+            data = data.astype("float32")[:, [0, 2]]
+            data /= 4.0
+            data = torch.from_numpy(data).float()
+            r = 4.5
+            data1 = data.clone() + torch.tensor([-r, -r])
+            data2 = data.clone() + torch.tensor([-r, r])
+            data3 = data.clone() + torch.tensor([r, -r])
+            data4 = data.clone() + torch.tensor([r, r])
+            self._data = torch.cat([data, data1, data2, data3, data4], axis=0)
+        elif dataset_type == 'checkerboard':
+            x1 = np.random.rand(n_samples) * 4 - 2
+            x2_ = np.random.rand(n_samples) - np.random.randint(0, 2, n_samples) * 2
+            x2 = x2_ + (np.floor(x1) % 2)
+            self._data = torch.from_numpy(np.concatenate([x1[:, None], x2[:, None]], 1) * 2).float()
+        elif dataset_type == 'ngaussian':
+            mix_probs = [1/num_mixture] * num_mixture
+            std = torch.stack([torch.ones(2) * sigma for _ in range(len(mix_probs))], dim=0)
+            mix_probs = torch.tensor(mix_probs)
+            mix_idx = torch.multinomial(mix_probs, n_samples, replacement=True)
+            thetas = np.linspace(0, 2 * np.pi, num_mixture, endpoint=False)
+            xs = radius * np.sin(thetas, dtype=np.float32)
+            ys = radius * np.cos(thetas, dtype=np.float32)
+            center = np.vstack([xs, ys]).T
+            center = torch.tensor(center)
+            centers = center[mix_idx]
+            stds = std[mix_idx]
+            self._data = torch.randn_like(centers) * stds + centers
+        else:
+            raise ValueError(f"Unknown dataset type: {dataset_type}")
+
+        # Convert to numpy for compatibility with Dataset base class
+        self._data = self._data.numpy().astype(np.float32)  # Shape [N, 2]
+        raw_shape = [len(self._data), 1, 2, 1]  # [N, C=1, H=2, W=1]
+        super().__init__(name=name, raw_shape=raw_shape, use_labels=use_labels, xflip=xflip, random_seed=random_seed, cache=cache)
+
+    def _load_raw_image(self, raw_idx):
+        # Return data as a "fake image" with shape [1, 2, 1] and dtype float32
+        data = self._data[raw_idx]  # Shape [2]
+        image = data.reshape(1, 2, 1)  # Shape [C=1, H=2, W=1]
+        return image
+
+    def _load_raw_labels(self):
+        return None  # No labels for these datasets
+
+    def __getitem__(self, idx):
+        image, label = super().__getitem__(idx)  # image is [1, 2, 1], float32
+        return image, label

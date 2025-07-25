@@ -1,3 +1,13 @@
+"""
+CUDA_VISIBLE_DEVCIES=0 torchrun \
+    --standalone --nproc_per_node=1 train.py \
+    --outdir=training-runs \
+    --data=custom:swissroll \
+    --dataset-type=swissroll \
+    --n-samples=8000 \
+    --cond=0 --arch=ddpmpp --precond=edm --batch=2048 --duration=200
+"""
+
 # Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # This work is licensed under a Creative Commons
@@ -77,6 +87,13 @@ def parse_int_list(s):
 @click.option('--resume',        help='Resume from previous training state', metavar='PT',          type=str)
 @click.option('-n', '--dry-run', help='Print training options and exit',                            is_flag=True)
 
+# Add these to the click options in train.py
+@click.option('--dataset-type',  help='Custom dataset type (swissroll|checkerboard|ngaussian)',     type=click.Choice(['swissroll', 'checkerboard', 'ngaussian']), default='swissroll', show_default=True)
+@click.option('--n-samples',     help='Number of samples for custom dataset', metavar='INT',        type=click.IntRange(min=1), default=8000, show_default=True)
+@click.option('--num-mixture',   help='Number of mixtures for NGaussianMixtures', metavar='INT',    type=click.IntRange(min=1), default=8, show_default=True)
+@click.option('--radius',        help='Radius for NGaussianMixtures', metavar='FLOAT',              type=click.FloatRange(min=0), default=8.0, show_default=True)
+@click.option('--sigma',         help='Sigma for NGaussianMixtures', metavar='FLOAT',               type=click.FloatRange(min=0), default=1.0, show_default=True)
+
 def main(**kwargs):
     """Train diffusion-based generative model using the techniques described in the
     paper "Elucidating the Design Space of Diffusion-Based Generative Models".
@@ -102,13 +119,28 @@ def main(**kwargs):
 
     # Validate dataset options.
     try:
+        if 'custom' in opts.data.lower():
+            dataset_type = opts.data.split(':')[-1] if ':' in opts.data else opts.dataset_type
+            c.dataset_kwargs.class_name = 'training.dataset.Custom2DDataset'
+            c.dataset_kwargs.dataset_type = dataset_type
+            c.dataset_kwargs.n_samples = opts.n_samples
+            c.dataset_kwargs.num_mixture = opts.num_mixture
+            c.dataset_kwargs.radius = opts.radius
+            c.dataset_kwargs.sigma = opts.sigma
+            # Set network to MLPPrecond for custom datasets
+            if opts.precond == 'edm':
+                c.network_kwargs.class_name = 'training.networks.MLPPrecond'
+            c.network_kwargs.hidden_channels = 128  # MLP-specific parameter
+            c.network_kwargs.num_layers = 4        # MLP-specific parameter
+        else:
+            c.dataset_kwargs.class_name = 'training.dataset.ImageFolderDataset'
         dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset_kwargs)
         dataset_name = dataset_obj.name
-        c.dataset_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution
-        c.dataset_kwargs.max_size = len(dataset_obj) # be explicit about dataset size
+        c.dataset_kwargs.resolution = dataset_obj.resolution  # be explicit about dataset resolution
+        c.dataset_kwargs.max_size = len(dataset_obj)  # be explicit about dataset size
         if opts.cond and not dataset_obj.has_labels:
             raise click.ClickException('--cond=True requires labels specified in dataset.json')
-        del dataset_obj # conserve memory
+        del dataset_obj  # conserve memory
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
 
@@ -130,10 +162,14 @@ def main(**kwargs):
     elif opts.precond == 've':
         c.network_kwargs.class_name = 'training.networks.VEPrecond'
         c.loss_kwargs.class_name = 'training.loss.VELoss'
-    else:
-        assert opts.precond == 'edm'
+    elif opts.precond == 'edm' and 'custom' not in opts.data.lower():
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
         c.loss_kwargs.class_name = 'training.loss.EDMLoss'
+    elif opts.precond == 'edm' and 'custom' in opts.data.lower():
+        c.network_kwargs.class_name = 'training.networks.MLPPrecond'
+        c.loss_kwargs.class_name = 'training.loss.EDMLoss'
+    else:
+        raise click.ClickException(f'--precond={opts.precond} not supported')
 
     # Network options.
     if opts.cbase is not None:
