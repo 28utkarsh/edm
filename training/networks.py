@@ -11,6 +11,7 @@
 import numpy as np
 import torch
 from torch_utils import persistence
+import torch.nn as nn
 from torch.nn.functional import silu
 
 #----------------------------------------------------------------------------
@@ -628,20 +629,64 @@ class iDDPMPrecond(torch.nn.Module):
 # Improved preconditioning proposed in the paper "Elucidating the Design
 # Space of Diffusion-Based Generative Models" (EDM).
 
+class FourierFeatureTransform(nn.Module):
+    """
+    Transform inputs via fixed random Fourier features.
+    """
+
+    def __init__(self, input_dim: int, mapping_size: int = 128,
+                 scale: float = 10) -> None:
+        super().__init__()
+        self.input_dim = input_dim
+        self.mapping_size = mapping_size
+        self.scale = scale
+        self.B = nn.Parameter(
+            torch.randn(input_dim, mapping_size) * scale,
+            requires_grad=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_proj = 2 * np.pi * x @ self.B
+        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+
+class ResidualBlock(nn.Module):
+    """
+    Residual block with normalization, activation, and dropout.
+    """
+
+    def __init__(self, hidden_dim: int, dropout_rate: float = 0.1) -> None:
+        super().__init__()
+        self.linear = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        out = self.linear(x)
+        out = self.norm(out)
+        out = self.activation(out)
+        out = self.dropout(out)
+        return out + identity
+
 @persistence.persistent_class
-class MLPPrecond(torch.nn.Module):
-    def __init__(self,
-        img_resolution=2,                   # Dimensionality of the input (2 for 2D points).
-        img_channels=1,                     # Number of channels (1 for 2D points).
-        label_dim=0,                        # Number of class labels, 0 = unconditional.
-        use_fp16=False,                     # Execute the model at FP16 precision?
-        sigma_min=0,                        # Minimum supported noise level.
-        sigma_max=float('inf'),             # Maximum supported noise level.
-        sigma_data=0.5,                     # Expected standard deviation of the training data.
-        hidden_channels=128,                # Number of hidden channels in the MLP.
-        num_layers=4,                       # Number of hidden layers in the MLP.
-        **super_kwargs,                # Additional keyword arguments for the MLP.
-    ):
+class MLPPrecond(nn.Module):
+    def __init__(
+        self,
+        img_resolution=2,
+        img_channels=1,
+        label_dim=0,
+        use_fp16=False,
+        sigma_min=0,
+        sigma_max=float('inf'),
+        sigma_data=0.5,
+        hidden_dim: int = 4096,
+        num_layers: int = 6,
+        dropout_rate: float = 0.1,
+        mapping_size: int = 256,
+        scale: float = 10,
+        **kwargs,
+    ) -> None:
         super().__init__()
         self.img_resolution = img_resolution
         self.img_channels = img_channels
@@ -651,49 +696,49 @@ class MLPPrecond(torch.nn.Module):
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
 
-        # MLP architecture
-        layers = []
-        in_features = img_channels * img_resolution + hidden_channels  # Input: x (2) + embedding (hidden_channels)
-        for i in range(num_layers):
-            out_features = hidden_channels if i < num_layers - 1 else img_channels * img_resolution
-            layers.append(Linear(in_features=in_features, out_features=out_features))
-            if i < num_layers - 1:
-                layers.append(torch.nn.ReLU())
-            in_features = out_features
-        self.mlp = torch.nn.Sequential(*layers)
+        self.fft_space = FourierFeatureTransform(img_resolution, mapping_size=mapping_size, scale=scale)
+        self.fft_time = FourierFeatureTransform(1, mapping_size=mapping_size, scale=scale)
+        self.input_layer = nn.Linear(mapping_size * 4, hidden_dim)
+        self.blocks = nn.ModuleList([
+            ResidualBlock(hidden_dim, dropout_rate)
+            for _ in range(num_layers)
+        ])
+        self.output_layer = nn.Linear(hidden_dim, img_resolution)
+        self._init_weights()
 
-        # Noise embedding
-        self.map_noise = PositionalEmbedding(num_channels=hidden_channels)
-        self.map_layer = Linear(in_features=hidden_channels, out_features=hidden_channels)
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x, sigma, class_labels=None, force_fp32=False, **model_kwargs):
         x = x.to(torch.float32)
-        sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)  # Match input shape [batch, 1, 1, 1]
+        sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
         class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
-        # EDM preconditioning
-        c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)  # [batch, 1, 1, 1]
-        c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()  # [batch, 1, 1, 1]
-        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()  # [batch, 1, 1, 1]
-        c_noise = sigma.log() / 4  # [batch, 1, 1, 1]
+        c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
+        c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
+        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
+        c_noise = sigma.log() / 4
 
-        # Reshape input: [batch, 1, 2, 1] -> [batch, 2]
-        x = x.squeeze(-1).view(x.size(0), -1).to(dtype)  # [batch, 2]
+        orig_x = x
+        x = c_in * x
+        x = x.squeeze(-1).squeeze(1).to(dtype)
 
-        # Noise embedding
-        emb = self.map_noise(c_noise.flatten())  # [batch, hidden_channels]
-        emb = silu(self.map_layer(emb))  # [batch, hidden_channels]
+        t = c_noise.flatten().unsqueeze(-1)
 
-        # Concatenate input and embedding
-        x = torch.cat([x, emb], dim=1)  # [batch, 2 + hidden_channels]
-
-        # Process through MLP
-        x = self.mlp(x).to(torch.float32)  # [batch, 2]
-
-        # Apply preconditioning
-        D_x = c_skip.squeeze().unsqueeze(-1) * x + c_out.squeeze().unsqueeze(-1) * x  # [batch, 2]
-        return D_x.view(-1, self.img_channels, self.img_resolution, 1)  # [batch, 1, 2, 1]
+        space_feat = self.fft_space(x)
+        time_feat = self.fft_time(t)
+        combined = torch.cat([space_feat, time_feat], dim=-1)
+        out = self.input_layer(combined)
+        for block in self.blocks:
+            out = block(out)
+        F_x = self.output_layer(out).to(torch.float32)
+        D_x = c_skip.squeeze().unsqueeze(-1) * orig_x.squeeze(1).squeeze(-1) + c_out.squeeze().unsqueeze(-1) * F_x
+        return D_x.view(-1, self.img_channels, self.img_resolution, 1)
 
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma)
