@@ -14,8 +14,8 @@ torchrun --standalone --nproc_per_node=1 generate.py \
 # You should have received a copy of the license along with this
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
-"""Generate random 2D point cloud samples using the techniques described in the paper
-"Elucidating the Design Space of Diffusion-Based Generative Models"."""
+"""Generate random 2D point cloud samples and compute evaluation metrics (Wasserstein, MMD, NLL)
+using the techniques described in the paper "Elucidating the Design Space of Diffusion-Based Generative Models"."""
 
 import os
 import re
@@ -24,9 +24,12 @@ import tqdm
 import pickle
 import numpy as np
 import torch
+import json
 import dnnlib
 from torch_utils import distributed as dist
 import matplotlib.pyplot as plt
+from sklearn.neighbors import KernelDensity
+import ot
 
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
@@ -220,6 +223,47 @@ def parse_int_list(s):
     return ranges
 
 #----------------------------------------------------------------------------
+# MMD computation with Gaussian kernel
+
+def compute_mmd(samples1, samples2, sigma=1.0):
+    """Compute Maximum Mean Discrepancy with Gaussian kernel."""
+    n1, n2 = len(samples1), len(samples2)
+    X = samples1
+    Y = samples2
+    
+    # Compute kernel matrices
+    XX = torch.cdist(X, X, p=2) ** 2
+    YY = torch.cdist(Y, Y, p=2) ** 2
+    XY = torch.cdist(X, Y, p=2) ** 2
+    
+    # Gaussian kernel
+    K_XX = torch.exp(-XX / (2 * sigma ** 2))
+    K_YY = torch.exp(-YY / (2 * sigma ** 2))
+    K_XY = torch.exp(-XY / (2 * sigma ** 2))
+    
+    # MMD calculation
+    mmd = (K_XX.sum() / (n1 * n1) + K_YY.sum() / (n2 * n2) - 2 * K_XY.sum() / (n1 * n2)).item()
+    return mmd
+
+#----------------------------------------------------------------------------
+# Load true dataset samples
+
+def load_true_samples(dataset_type, n_samples=8000, num_mixture=8, radius=8.0, sigma=1.0):
+    """Load true samples from Custom2DDataset."""
+    from training.dataset import Custom2DDataset
+    dataset = Custom2DDataset(
+        path=f'custom:{dataset_type}',
+        dataset_type=dataset_type,
+        n_samples=n_samples,
+        num_mixture=num_mixture,
+        radius=radius,
+        sigma=sigma
+    )
+    indices = np.random.choice(len(dataset), size=n_samples, replace=False)
+    samples = np.array([dataset[i][0].squeeze(0).squeeze(-1) for i in indices])  # Shape [n_samples, 2]
+    return torch.from_numpy(samples).float()
+
+#----------------------------------------------------------------------------
 
 @click.command()
 @click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
@@ -241,18 +285,22 @@ def parse_int_list(s):
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
 @click.option('--dataset-type',            help='Custom dataset type (swissroll|checkerboard|ngaussian)', type=click.Choice(['swissroll', 'checkerboard', 'ngaussian']), default='swissroll', show_default=True)
+@click.option('--n-samples',               help='Number of true samples for metrics', metavar='INT', type=click.IntRange(min=1), default=8000, show_default=True)
+@click.option('--num-mixture',             help='Number of mixtures for NGaussianMixtures', metavar='INT', type=click.IntRange(min=1), default=8, show_default=True)
+@click.option('--radius',                  help='Radius for NGaussianMixtures', metavar='FLOAT', type=click.FloatRange(min=0), default=8.0, show_default=True)
+@click.option('--sigma',                   help='Sigma for NGaussianMixtures', metavar='FLOAT', type=click.FloatRange(min=0), default=1.0, show_default=True)
 
-def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, dataset_type, **sampler_kwargs):
-    """Generate random 2D point cloud samples using the techniques described in the paper
-    "Elucidating the Design Space of Diffusion-Based Generative Models".
+def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, dataset_type, n_samples, num_mixture, radius, sigma, **sampler_kwargs):
+    """Generate random 2D point cloud samples and compute evaluation metrics (Wasserstein, MMD, NLL)
+    using the techniques described in the paper "Elucidating the Design Space of Diffusion-Based Generative Models".
 
     Examples:
 
     \b
-    # Generate 1000 points for SwissRoll dataset
+    # Generate 1000 points for SwissRoll dataset and compute metrics
     torchrun --standalone --nproc_per_node=8 generate.py --outdir=generated-samples \\
         --network=training-runs/00001-swissroll-uncond-ddpmpp-edm-gpus8-batch512-fp32/network-snapshot-002000.pkl \\
-        --seeds=0-999 --batch=1000 --steps=40 --dataset-type=swissroll
+        --seeds=0-999 --batch=1000 --steps=40 --dataset-type=swissroll --n-samples=1000
     """
     dist.init()
     device = torch.device('cuda')
@@ -270,9 +318,16 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, dataset
     with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
         net = pickle.load(f)['ema'].to(device)
 
+    # Load true dataset samples for metrics.
+    dist.print0(f'Loading true {dataset_type} samples for metrics...')
+    true_samples = load_true_samples(dataset_type, n_samples=n_samples, num_mixture=num_mixture, radius=radius, sigma=sigma).to(device)
+
     # Other ranks follow.
     if dist.get_rank() == 0:
         torch.distributed.barrier()
+
+    # Initialize metrics storage.
+    metrics = {'wasserstein': [], 'mmd': [], 'nll': []}
 
     # Loop over batches.
     dist.print0(f'Generating {len(seeds)} samples to "{outdir}"...')
@@ -298,22 +353,57 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, dataset
         sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
         samples = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
 
-        # Save samples as NumPy arrays.
+        # Convert samples to numpy for saving and metrics.
         samples_np = samples.to(torch.float32).cpu().numpy()  # [batch, 1, 2, 1]
+        points = samples_np.squeeze(1).squeeze(-1)  # [batch, 2]
+        points = torch.from_numpy(points).to(device)  # [batch, 2]
+
+        # Compute metrics (only on rank 0 to avoid duplication).
+        if dist.get_rank() == 0:
+            # Wasserstein distance (Wasserstein-2 via optimal transport).
+            true_points = true_samples[:batch_size]  # Match batch size
+            cost_matrix = torch.cdist(points, true_points, p=2) ** 2  # [batch, batch]
+            a = torch.ones(batch_size, device=device) / batch_size  # Uniform distribution
+            b = torch.ones(batch_size, device=device) / batch_size
+            wasserstein = ot.emd2(a, b, cost_matrix).item()
+            metrics['wasserstein'].append(wasserstein)
+
+            # MMD with Gaussian kernel.
+            mmd = compute_mmd(points, true_points, sigma=1.0)
+            metrics['mmd'].append(mmd)
+
+            # NLL via KDE.
+            kde = KernelDensity(kernel='gaussian', bandwidth=0.1).fit(true_points.cpu().numpy())
+            nll = -kde.score_samples(points.cpu().numpy()).mean()
+            metrics['nll'].append(nll)
+
+        # Save samples as NumPy arrays.
         if dist.get_rank() == 0:
             output_dir = os.path.join(outdir, f'{batch_seeds[0]-batch_seeds[0]%1000:06d}') if subdirs else outdir
             os.makedirs(output_dir, exist_ok=True)
             np.save(os.path.join(output_dir, f'samples_{batch_seeds[0]}-{batch_seeds[-1]}.npy'), samples_np)
 
-            # Optional: Visualize as scatter plot.
-            points = samples_np.squeeze(1).squeeze(-1)  # [batch, 2]
+            # Visualize as scatter plot.
             plt.figure(figsize=(8, 8))
-            plt.scatter(points[:, 0], points[:, 1], s=1)
+            plt.scatter(points.cpu().numpy()[:, 0], points.cpu().numpy()[:, 1], s=1, label='Generated')
+            plt.scatter(true_points.cpu().numpy()[:, 0], true_points.cpu().numpy()[:, 1], s=1, alpha=0.5, label='True')
             plt.title(f'{dataset_type} Samples (Seeds {batch_seeds[0]}-{batch_seeds[-1]})')
             plt.xlabel('X')
             plt.ylabel('Y')
+            plt.legend()
             plt.savefig(os.path.join(output_dir, f'samples_{batch_seeds[0]}-{batch_seeds[-1]}.png'))
             plt.close()
+
+    # Aggregate and save metrics.
+    if dist.get_rank() == 0:
+        metrics_avg = {
+            'wasserstein': np.mean(metrics['wasserstein']),
+            'mmd': np.mean(metrics['mmd']),
+            'nll': np.mean(metrics['nll'])
+        }
+        with open(os.path.join(outdir, 'metrics.json'), 'w') as f:
+            json.dump(metrics_avg, f, indent=2)
+        dist.print0(f'Metrics: {metrics_avg}')
 
     # Done.
     torch.distributed.barrier()

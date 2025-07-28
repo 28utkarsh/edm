@@ -3,6 +3,31 @@ import subprocess
 import json
 import numpy as np
 import argparse
+import time
+
+def find_latest_directory(path):
+    try:
+        directories = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
+        if not directories:
+            return None, None
+        return max(directories, 
+                        key=lambda d: os.path.getmtime(os.path.join(path, d)))
+    except FileNotFoundError:
+        return None, "Directory path not found"
+    except Exception as e:
+        return None, f"Error: {str(e)}"
+
+def find_latest_pkl_file(path):
+    try:
+        pkl_files = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f)) and f.endswith('.pkl')]
+        if not pkl_files:
+            return None, "No .pkl files found"
+        return max(pkl_files, 
+                         key=lambda f: os.path.getmtime(os.path.join(path, f)))
+    except FileNotFoundError:
+        return None, "Directory path not found"
+    except Exception as e:
+        return None, f"Error: {str(e)}"
 
 def run_experiment(dataset, seeds, base_outdir, gen_outdir, n_samples, num_steps, batch_size, master_port, num_mixture=8, radius=8.0, sigma=1.0):
     # Ensure output directories exist
@@ -17,7 +42,7 @@ def run_experiment(dataset, seeds, base_outdir, gen_outdir, n_samples, num_steps
         # Training command
         train_cmd = [
             "torchrun", "--standalone", f"--nproc_per_node=4", f"--master_port={master_port}",
-            "/data/utkarsh/edm/train.py",
+            "train.py",
             "--outdir", base_outdir,
             "--data", f"custom:{dataset}",
             "--dataset-type", dataset,
@@ -26,8 +51,8 @@ def run_experiment(dataset, seeds, base_outdir, gen_outdir, n_samples, num_steps
             "--arch", "ddpmpp",
             "--precond", "edm",
             "--duration", "200",
-            "--batch", "512",
-            "--sigma-data", "0.5",
+            "--batch", "1024",
+            "--sigma", "0.5",
             "--seed", str(seed)
         ]
         if dataset == "ngaussian":
@@ -37,16 +62,16 @@ def run_experiment(dataset, seeds, base_outdir, gen_outdir, n_samples, num_steps
         subprocess.run(train_cmd, check=True)
 
         # Find the latest snapshot
-        run_dir = max([d for d in os.listdir(base_outdir) if d.startswith(f"{seed:05d}-{dataset}")], key=lambda x: os.path.getctime(os.path.join(base_outdir, x)))
-        snapshot = os.path.join(base_outdir, run_dir, "network-snapshot-002000.pkl")
+        run_dir = find_latest_directory(base_outdir)
+        snapshot = os.path.join(base_outdir, run_dir, find_latest_pkl_file(os.path.join(base_outdir, run_dir)))
 
         # Generation command
         gen_cmd = [
-            "torchrun", "--standalone", f"--nproc_per_node=8", f"--master_port={master_port}",
-            "/data/utkarsh/edm/generate.py",
+            "torchrun", "--standalone", f"--nproc_per_node=4", f"--master_port={master_port}",
+            "generate.py",
             "--outdir", gen_outdir,
             "--network", snapshot,
-            "--seeds", "0-999",
+            "--seeds", "0-7999",
             "--batch", str(batch_size),
             "--steps", str(num_steps),
             "--dataset-type", dataset,
