@@ -15,6 +15,7 @@ import json
 import torch
 import dnnlib
 import sklearn.datasets
+from torchvision import transforms, datasets
 
 try:
     import pyspng
@@ -159,6 +160,47 @@ class Dataset(torch.utils.data.Dataset):
     @property
     def has_onehot_labels(self):
         return self._get_raw_labels().dtype == np.int64
+
+#----------------------------------------------------------------------------
+# Dataset subclass for MNIST dataset using torchvision.
+
+class MNISTDataset(Dataset):
+    def __init__(self,
+        path,                   # Path to store/download MNIST dataset.
+        use_labels=True,       # Enable conditioning labels? True for class-conditional training.
+        xflip=False,           # Artificially double the dataset via x-flips.
+        random_seed=0,         # Random seed for max_size.
+        cache=True,            # Cache data in CPU memory?
+        max_size=None,         # Artificially limit the size of the dataset. None = no limit.
+        resolution=28,         # Image resolution (28 for MNIST).
+    ):
+        self._path = path
+        name = 'mnist'
+        self._cache = cache
+        self._cached_images = dict()  # {raw_idx: np.ndarray, ...}
+
+        # Load MNIST dataset
+        transform = transforms.ToTensor()  # Converts to [0,1], shape [1, 28, 28]
+        self._mnist_dataset = datasets.MNIST(root=self._path, train=True, download=False, transform=transform)
+        raw_shape = [len(self._mnist_dataset), 1, resolution, resolution]  # [N, C=1, H=28, W=28]
+        
+        super().__init__(name=name, raw_shape=raw_shape, use_labels=use_labels, xflip=xflip, random_seed=random_seed, cache=cache, max_size=max_size)
+
+    def _load_raw_image(self, raw_idx):
+        image, _ = self._mnist_dataset[raw_idx]  # image is [1, 28, 28], float32 in [0,1]
+        image = image.numpy() * 255.0  # Convert to [0,255] for consistency with ImageFolderDataset
+        image = image.astype(np.uint8)  # Convert to uint8
+        return image
+
+    def _load_raw_labels(self):
+        if not self._use_labels:
+            return None
+        labels = [self._mnist_dataset[i][1] for i in range(len(self._mnist_dataset))]
+        labels = np.array(labels, dtype=np.int64)  # Shape [N], int64
+        return labels
+
+    def close(self):
+        pass  # No resources to close
 
 #----------------------------------------------------------------------------
 # Dataset subclass that loads images recursively from the specified directory

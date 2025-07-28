@@ -1,12 +1,3 @@
-"""
-torchrun --standalone --nproc_per_node=1 generate.py \
-    --outdir=generated-samples \
-    --network=training-runs/00023-swissroll-uncond-ddpmpp-edm-gpus1-batch2048-fp32/network-snapshot-002000.pkl \
-    --seeds=0-999 \
-    --batch=1000 \
-    --steps=40 \
-    --dataset-type=swissroll
-"""
 # Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # This work is licensed under a Creative Commons
@@ -14,8 +5,8 @@ torchrun --standalone --nproc_per_node=1 generate.py \
 # You should have received a copy of the license along with this
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
-"""Generate random 2D point cloud samples and compute evaluation metrics (Wasserstein, MMD, NLL)
-using the techniques described in the paper "Elucidating the Design Space of Diffusion-Based Generative Models"."""
+"""Generate random MNIST images and compute FID score using the techniques described in the paper
+"Elucidating the Design Space of Diffusion-Based Generative Models"."""
 
 import os
 import re
@@ -27,9 +18,11 @@ import torch
 import json
 import dnnlib
 from torch_utils import distributed as dist
-import matplotlib.pyplot as plt
-from sklearn.neighbors import KernelDensity
-import ot
+import PIL.Image
+from pytorch_fid import fid_score
+from pytorch_fid.inception import InceptionV3
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
 
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
@@ -207,6 +200,87 @@ class StackedRandomGenerator:
         return torch.stack([torch.randint(*args, size=size[1:], generator=gen, **kwargs) for gen in self.generators])
 
 #----------------------------------------------------------------------------
+# FID computation using pytorch-fid library
+
+def compute_fid_pytorch_fid(original_images, generated_images, batch_size=50, device='cuda' if torch.cuda.is_available() else 'cpu', dims=2048):
+    """
+    Compute FID score using pytorch-fid library for two sets of images.
+
+    Args:
+        original_images (torch.Tensor or np.ndarray): Shape (N, 784), original dataset images, values in [0, 1].
+        generated_images (torch.Tensor or np.ndarray): Shape (N, 784), generated dataset images, values in [0, 1].
+        batch_size (int): Batch size for processing images through Inception V3.
+        device (str): Device to run computations ('cuda' or 'cpu').
+        dims (int): Dimensionality of Inception V3 features (default: 2048).
+
+    Returns:
+        float: FID score.
+    """
+    # Load Inception V3 model
+    block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
+    model = InceptionV3([block_idx]).to(device).eval()
+
+    # Define preprocessing: Reshape, convert to 3-channel, resize to 299x299, normalize
+    preprocess = transforms.Compose([
+        transforms.Lambda(lambda x: x.view(-1, 1, 28, 28)),  # Reshape (N, 784) to (N, 1, 28, 28)
+        transforms.Lambda(lambda x: x.repeat(1, 3, 1, 1)),  # Repeat grayscale to 3 channels
+        transforms.Resize((299, 299), antialias=True),      # Resize to 299x299 for Inception V3
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # ImageNet normalization
+    ])
+
+    def get_activations(images, model, batch_size, device):
+        """Extract Inception V3 features for a dataset."""
+        n_batches = images.shape[0] // batch_size + (1 if images.shape[0] % batch_size else 0)
+        activations = []
+        for i in range(n_batches):
+            start = i * batch_size
+            end = min((i + 1) * batch_size, images.shape[0])
+            batch = images[start:end].to(device)
+            batch = preprocess(batch)
+            with torch.no_grad():
+                act = model(batch)[0]
+            # If model output is not scalar, apply global spatial average pooling
+            if act.size(2) != 1 or act.size(3) != 1:
+                act = torch.nn.functional.adaptive_avg_pool2d(act, output_size=(1, 1))
+            activations.append(act.squeeze().cpu().numpy())
+        return np.concatenate(activations, axis=0)
+
+    # Convert numpy arrays to torch tensors if necessary
+    if isinstance(original_images, np.ndarray):
+        original_images = torch.from_numpy(original_images).float()
+    if isinstance(generated_images, np.ndarray):
+        generated_images = torch.from_numpy(generated_images).float()
+
+    # Ensure inputs are float tensors
+    original_images = original_images.float()
+    generated_images = generated_images.float()
+
+    # Get activations for both datasets
+    act1 = get_activations(original_images, model, batch_size, device)
+    act2 = get_activations(generated_images, model, batch_size, device)
+
+    # Compute FID using pytorch-fid's calculate_frechet_distance
+    mu1, sigma1 = np.mean(act1, axis=0), np.cov(act1, rowvar=False)
+    mu2, sigma2 = np.mean(act2, axis=0), np.cov(act2, rowvar=False)
+    fid_value = fid_score.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
+
+    return fid_value
+
+#----------------------------------------------------------------------------
+# Load true MNIST samples
+
+def load_true_mnist_samples(n_samples=1000):
+    """Load true MNIST samples."""
+    transform = transforms.Compose([
+        transforms.ToTensor(),  # Converts to [0, 1]
+        transforms.Lambda(lambda x: x.view(-1))  # Flatten to [784]
+    ])
+    dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+    indices = np.random.choice(len(dataset), size=n_samples, replace=False)
+    samples = torch.stack([dataset[i][0] for i in indices])  # Shape [n_samples, 784]
+    return samples
+
+#----------------------------------------------------------------------------
 # Parse a comma separated list of numbers or ranges and return a list of ints.
 # Example: '1,2,5-10' returns [1, 2, 5, 6, 7, 8, 9, 10]
 
@@ -223,47 +297,6 @@ def parse_int_list(s):
     return ranges
 
 #----------------------------------------------------------------------------
-# MMD computation with Gaussian kernel
-
-def compute_mmd(samples1, samples2, sigma=1.0):
-    """Compute Maximum Mean Discrepancy with Gaussian kernel."""
-    n1, n2 = len(samples1), len(samples2)
-    X = samples1
-    Y = samples2
-    
-    # Compute kernel matrices
-    XX = torch.cdist(X, X, p=2) ** 2
-    YY = torch.cdist(Y, Y, p=2) ** 2
-    XY = torch.cdist(X, Y, p=2) ** 2
-    
-    # Gaussian kernel
-    K_XX = torch.exp(-XX / (2 * sigma ** 2))
-    K_YY = torch.exp(-YY / (2 * sigma ** 2))
-    K_XY = torch.exp(-XY / (2 * sigma ** 2))
-    
-    # MMD calculation
-    mmd = (K_XX.sum() / (n1 * n1) + K_YY.sum() / (n2 * n2) - 2 * K_XY.sum() / (n1 * n2)).item()
-    return mmd
-
-#----------------------------------------------------------------------------
-# Load true dataset samples
-
-def load_true_samples(dataset_type, n_samples=8000, num_mixture=8, radius=8.0, sigma=1.0):
-    """Load true samples from Custom2DDataset."""
-    from training.dataset import Custom2DDataset
-    dataset = Custom2DDataset(
-        path=f'custom:{dataset_type}',
-        dataset_type=dataset_type,
-        n_samples=n_samples,
-        num_mixture=num_mixture,
-        radius=radius,
-        sigma=sigma
-    )
-    indices = np.random.choice(len(dataset), size=n_samples, replace=False)
-    samples = np.array([dataset[i][0].squeeze(0).squeeze(-1) for i in indices])  # Shape [n_samples, 2]
-    return torch.from_numpy(samples).float()
-
-#----------------------------------------------------------------------------
 
 @click.command()
 @click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
@@ -271,7 +304,7 @@ def load_true_samples(dataset_type, n_samples=8000, num_mixture=8, radius=8.0, s
 @click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-999', show_default=True)
 @click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
 @click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
-@click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=1000, show_default=True)
+@click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
 @click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=40, show_default=True)
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
 @click.option('--sigma_max',               help='Highest noise level  [default: varies]', metavar='FLOAT',          type=click.FloatRange(min=0, min_open=True))
@@ -284,26 +317,22 @@ def load_true_samples(dataset_type, n_samples=8000, num_mixture=8, radius=8.0, s
 @click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
-@click.option('--dataset-type',            help='Custom dataset type (swissroll|checkerboard|ngaussian)', type=click.Choice(['swissroll', 'checkerboard', 'ngaussian']), default='swissroll', show_default=True)
-@click.option('--n-samples',               help='Number of true samples for metrics', metavar='INT', type=click.IntRange(min=1), default=8000, show_default=True)
-@click.option('--num-mixture',             help='Number of mixtures for NGaussianMixtures', metavar='INT', type=click.IntRange(min=1), default=8, show_default=True)
-@click.option('--radius',                  help='Radius for NGaussianMixtures', metavar='FLOAT', type=click.FloatRange(min=0), default=8.0, show_default=True)
-@click.option('--sigma',                   help='Sigma for NGaussianMixtures', metavar='FLOAT', type=click.FloatRange(min=0), default=1.0, show_default=True)
+@click.option('--n-samples',               help='Number of true samples for metrics', metavar='INT', type=click.IntRange(min=1), default=1000, show_default=True)
 
-def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, dataset_type, n_samples, num_mixture, radius, sigma, **sampler_kwargs):
-    """Generate random 2D point cloud samples and compute evaluation metrics (Wasserstein, MMD, NLL)
-    using the techniques described in the paper "Elucidating the Design Space of Diffusion-Based Generative Models".
+def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, n_samples, **sampler_kwargs):
+    """Generate random MNIST images and compute FID score using the techniques described in the paper
+    "Elucidating the Design Space of Diffusion-Based Generative Models".
 
     Examples:
 
     \b
-    # Generate 1000 points for SwissRoll dataset and compute metrics
-    torchrun --standalone --nproc_per_node=8 generate.py --outdir=generated-samples \\
-        --network=training-runs/00001-swissroll-uncond-ddpmpp-edm-gpus8-batch512-fp32/network-snapshot-002000.pkl \\
-        --seeds=0-999 --batch=1000 --steps=40 --dataset-type=swissroll --n-samples=1000
+    # Generate 1000 MNIST images and compute FID
+    torchrun --standalone --nproc_per_node=1 generate.py --outdir=generated-samples \\
+        --network=training-runs/00023-mnist-uncond-ddpmpp-edm-gpus1-batch2048-fp32/network-snapshot-002000.pkl \\
+        --seeds=0-999 --batch=64 --steps=40 --n-samples=1000
     """
     dist.init()
-    device = torch.device('cuda')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     num_batches = ((len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1) * dist.get_world_size()
     all_batches = torch.as_tensor(seeds).tensor_split(num_batches)
@@ -318,19 +347,20 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, dataset
     with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
         net = pickle.load(f)['ema'].to(device)
 
-    # Load true dataset samples for metrics.
-    dist.print0(f'Loading true {dataset_type} samples for metrics...')
-    true_samples = load_true_samples(dataset_type, n_samples=n_samples, num_mixture=num_mixture, radius=radius, sigma=sigma).to(device)
+    # Load true MNIST samples for FID.
+    dist.print0(f'Loading true MNIST samples for FID...')
+    true_samples = load_true_mnist_samples(n_samples=n_samples).to(device)  # [n_samples, 784]
 
     # Other ranks follow.
     if dist.get_rank() == 0:
         torch.distributed.barrier()
 
     # Initialize metrics storage.
-    metrics = {'wasserstein': [], 'mmd': [], 'nll': []}
+    metrics = {'fid': []}
 
     # Loop over batches.
-    dist.print0(f'Generating {len(seeds)} samples to "{outdir}"...')
+    dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
+    generated_samples = []
     for batch_seeds in tqdm.tqdm(rank_batches, unit='batch', disable=(dist.get_rank() != 0)):
         torch.distributed.barrier()
         batch_size = len(batch_seeds)
@@ -339,7 +369,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, dataset
 
         # Pick latents and labels.
         rnd = StackedRandomGenerator(device, batch_seeds)
-        latents = rnd.randn([batch_size, net.img_channels, net.img_resolution, 1], device=device)  # [batch, 1, 2, 1]
+        latents = rnd.randn([batch_size, net.img_channels, net.img_resolution, net.img_resolution], device=device)  # [batch, 1, 28, 28]
         class_labels = None
         if net.label_dim:
             class_labels = torch.eye(net.label_dim, device=device)[rnd.randint(net.label_dim, size=[batch_size], device=device)]
@@ -353,54 +383,28 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, dataset
         sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
         samples = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
 
-        # Convert samples to numpy for saving and metrics.
-        samples_np = samples.to(torch.float32).cpu().numpy()  # [batch, 1, 2, 1]
-        points = samples_np.squeeze(1).squeeze(-1)  # [batch, 2]
-        points = torch.from_numpy(points).to(device)  # [batch, 2]
+        # Convert samples to numpy for saving and FID.
+        samples_np = samples.to(torch.float32).cpu().numpy()  # [batch, 1, 28, 28]
+        samples_flat = samples_np.reshape(batch_size, -1)  # [batch, 784]
+        generated_samples.append(samples_flat)
 
-        # Compute metrics (only on rank 0 to avoid duplication).
-        if dist.get_rank() == 0:
-            # Wasserstein distance (Wasserstein-2 via optimal transport).
-            true_points = true_samples[:batch_size]  # Match batch size
-            cost_matrix = torch.cdist(points, true_points, p=2) ** 2  # [batch, batch]
-            a = torch.ones(batch_size, device=device) / batch_size  # Uniform distribution
-            b = torch.ones(batch_size, device=device) / batch_size
-            wasserstein = ot.emd2(a, b, cost_matrix).item()
-            metrics['wasserstein'].append(wasserstein)
-
-            # MMD with Gaussian kernel.
-            mmd = compute_mmd(points, true_points, sigma=1.0)
-            metrics['mmd'].append(mmd)
-
-            # NLL via KDE.
-            kde = KernelDensity(kernel='gaussian', bandwidth=0.1).fit(true_points.cpu().numpy())
-            nll = -kde.score_samples(points.cpu().numpy()).mean()
-            metrics['nll'].append(nll)
-
-        # Save samples as NumPy arrays.
+        # Save images.
         if dist.get_rank() == 0:
             output_dir = os.path.join(outdir, f'{batch_seeds[0]-batch_seeds[0]%1000:06d}') if subdirs else outdir
             os.makedirs(output_dir, exist_ok=True)
-            np.save(os.path.join(output_dir, f'samples_{batch_seeds[0]}-{batch_seeds[-1]}.npy'), samples_np)
+            images_np = (samples_np * 127.5 + 128).clip(0, 255).astype(np.uint8).transpose(0, 2, 3, 1)  # [batch, 28, 28, 1]
+            for seed, image_np in zip(batch_seeds, images_np):
+                image_path = os.path.join(output_dir, f'{seed:06d}.png')
+                PIL.Image.fromarray(image_np[:, :, 0], 'L').save(image_path)
 
-            # Visualize as scatter plot.
-            plt.figure(figsize=(8, 8))
-            plt.scatter(points.cpu().numpy()[:, 0], points.cpu().numpy()[:, 1], s=1, label='Generated')
-            plt.scatter(true_points.cpu().numpy()[:, 0], true_points.cpu().numpy()[:, 1], s=1, alpha=0.5, label='True')
-            plt.title(f'{dataset_type} Samples (Seeds {batch_seeds[0]}-{batch_seeds[-1]})')
-            plt.xlabel('X')
-            plt.ylabel('Y')
-            plt.legend()
-            plt.savefig(os.path.join(output_dir, f'samples_{batch_seeds[0]}-{batch_seeds[-1]}.png'))
-            plt.close()
-
-    # Aggregate and save metrics.
+    # Compute FID (only on rank 0).
     if dist.get_rank() == 0:
-        metrics_avg = {
-            'wasserstein': np.mean(metrics['wasserstein']),
-            'mmd': np.mean(metrics['mmd']),
-            'nll': np.mean(metrics['nll'])
-        }
+        generated_samples = np.concatenate(generated_samples, axis=0)  # [n_total, 784]
+        fid = compute_fid_pytorch_fid(true_samples.cpu().numpy(), generated_samples, batch_size=max_batch_size, device=device)
+        metrics['fid'].append(fid)
+
+        # Save metrics.
+        metrics_avg = {'fid': float(np.mean(metrics['fid']))}
         with open(os.path.join(outdir, 'metrics.json'), 'w') as f:
             json.dump(metrics_avg, f, indent=2)
         dist.print0(f'Metrics: {metrics_avg}')

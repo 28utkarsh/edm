@@ -1,11 +1,14 @@
 """
-CUDA_VISIBLE_DEVCIES=0 torchrun \
-    --standalone --nproc_per_node=1 train.py \
+CUDA_VISIBLE_DEVICES=0 torchrun \
+    --standalone --nproc_per_node=4 train.py \
     --outdir=training-runs \
-    --data=custom:swissroll \
-    --dataset-type=swissroll \
-    --n-samples=8000 \
-    --cond=0 --arch=ddpmpp --precond=edm --batch=2048 --duration=200
+    --data=./data/mnist \
+    --cond=1 \
+    --arch=adm \
+    --precond=edm \
+    --batch=256 \
+    --duration=200 \
+    --augment=0.12
 """
 
 # Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -52,7 +55,7 @@ def parse_int_list(s):
 
 # Main options.
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
-@click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
+@click.option('--data',          help='Path to the dataset (directory, ZIP, or MNIST path)', metavar='DIR|ZIP', type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm',       type=click.Choice(['vp', 've', 'edm']), default='edm', show_default=True)
@@ -63,7 +66,7 @@ def parse_int_list(s):
 @click.option('--batch-gpu',     help='Limit batch size per GPU', metavar='INT',                    type=click.IntRange(min=1))
 @click.option('--cbase',         help='Channel multiplier  [default: varies]', metavar='INT',       type=int)
 @click.option('--cres',          help='Channels per resolution  [default: varies]', metavar='LIST', type=parse_int_list)
-@click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=10e-4, show_default=True)
+@click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=1e-4, show_default=True)
 @click.option('--ema',           help='EMA half-life', metavar='MIMG',                              type=click.FloatRange(min=0), default=0.5, show_default=True)
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
@@ -87,7 +90,7 @@ def parse_int_list(s):
 @click.option('--resume',        help='Resume from previous training state', metavar='PT',          type=str)
 @click.option('-n', '--dry-run', help='Print training options and exit',                            is_flag=True)
 
-# Add these to the click options in train.py
+# Custom dataset options (for datasets like SwissRoll, retained for compatibility)
 @click.option('--dataset-type',  help='Custom dataset type (swissroll|checkerboard|ngaussian)',     type=click.Choice(['swissroll', 'checkerboard', 'ngaussian']), default='swissroll', show_default=True)
 @click.option('--n-samples',     help='Number of samples for custom dataset', metavar='INT',        type=click.IntRange(min=1), default=8000, show_default=True)
 @click.option('--num-mixture',   help='Number of mixtures for NGaussianMixtures', metavar='INT',    type=click.IntRange(min=1), default=8, show_default=True)
@@ -101,9 +104,9 @@ def main(**kwargs):
     Examples:
 
     \b
-    # Train DDPM++ model for class-conditional CIFAR-10 using 8 GPUs
-    torchrun --standalone --nproc_per_node=8 train.py --outdir=training-runs \\
-        --data=datasets/cifar10-32x32.zip --cond=1 --arch=ddpmpp
+    # Train ADM model for class-conditional MNIST using 1 GPU
+    torchrun --standalone --nproc_per_node=1 train.py --outdir=training-runs \\
+        --data=./data/mnist --cond=1 --arch=adm --precond=edm --batch=512 --augment=0.12
     """
     opts = dnnlib.EasyDict(kwargs)
     torch.multiprocessing.set_start_method('spawn')
@@ -111,7 +114,7 @@ def main(**kwargs):
 
     # Initialize config dict.
     c = dnnlib.EasyDict()
-    c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
+    c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.MNISTDataset', path=opts.data, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
@@ -133,13 +136,13 @@ def main(**kwargs):
             c.network_kwargs.hidden_channels = 128  # MLP-specific parameter
             c.network_kwargs.num_layers = 4        # MLP-specific parameter
         else:
-            c.dataset_kwargs.class_name = 'training.dataset.ImageFolderDataset'
+            c.dataset_kwargs.class_name = 'training.dataset.MNISTDataset' if 'mnist' in opts.data.lower() else 'training.dataset.ImageFolderDataset'
         dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset_kwargs)
         dataset_name = dataset_obj.name
         c.dataset_kwargs.resolution = dataset_obj.resolution  # be explicit about dataset resolution
         c.dataset_kwargs.max_size = len(dataset_obj)  # be explicit about dataset size
         if opts.cond and not dataset_obj.has_labels:
-            raise click.ClickException('--cond=True requires labels specified in dataset.json')
+            raise click.ClickException('--cond=True requires labels specified in dataset')
         del dataset_obj  # conserve memory
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
@@ -147,10 +150,10 @@ def main(**kwargs):
     # Network architecture.
     if opts.arch == 'ddpmpp':
         c.network_kwargs.update(model_type='SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[2,2,2])
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[1,2,2,2])
     elif opts.arch == 'ncsnpp':
         c.network_kwargs.update(model_type='SongUNet', embedding_type='fourier', encoder_type='residual', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[2,2,2])
+        c.network_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[1,2,2,2])
     else:
         assert opts.arch == 'adm'
         c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])
@@ -162,11 +165,8 @@ def main(**kwargs):
     elif opts.precond == 've':
         c.network_kwargs.class_name = 'training.networks.VEPrecond'
         c.loss_kwargs.class_name = 'training.loss.VELoss'
-    elif opts.precond == 'edm' and 'custom' not in opts.data.lower():
-        c.network_kwargs.class_name = 'training.networks.EDMPrecond'
-        c.loss_kwargs.class_name = 'training.loss.EDMLoss'
-    elif opts.precond == 'edm' and 'custom' in opts.data.lower():
-        c.network_kwargs.class_name = 'training.networks.MLPPrecond'
+    elif opts.precond == 'edm':
+        c.network_kwargs.class_name = 'training.networks.EDMPrecond' if 'custom' not in opts.data.lower() else 'training.networks.MLPPrecond'
         c.loss_kwargs.class_name = 'training.loss.EDMLoss'
     else:
         raise click.ClickException(f'--precond={opts.precond} not supported')
@@ -268,5 +268,3 @@ def main(**kwargs):
 
 if __name__ == "__main__":
     main()
-
-#----------------------------------------------------------------------------

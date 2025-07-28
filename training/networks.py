@@ -81,7 +81,7 @@ class Conv2d(torch.nn.Module):
             x = torch.nn.functional.conv2d(x, f.tile([self.out_channels, 1, 1, 1]), groups=self.out_channels, stride=2)
         else:
             if self.up:
-                x = torch.nn.functional.conv_transpose2d(x, f.mul(4).tile([self.in_channels, 1, 1, 1]), groups=self.in_channels, stride=2, padding=f_pad)
+                x = torch.nn.functional.conv_transpose2d(x, f.mul(4).tile([self.in_channels, 1, 1, 1]), groups=self.in_channels, stride=2, padding=f_pad, output_padding=1 if x.shape[-1]==3 else 0)
             if self.down:
                 x = torch.nn.functional.conv2d(x, f.tile([self.in_channels, 1, 1, 1]), groups=self.in_channels, stride=2, padding=f_pad)
             if w is not None:
@@ -454,7 +454,7 @@ class DhariwalUNet(torch.nn.Module):
             skips.append(x)
 
         # Decoder.
-        for block in self.dec.values():
+        for key, block in self.dec.items():
             if x.shape[1] != block.in_channels:
                 x = torch.cat([x, skips.pop()], dim=1)
             x = block(x, emb)

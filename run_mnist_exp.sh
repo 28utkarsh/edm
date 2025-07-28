@@ -1,0 +1,3 @@
+torchrun     --standalone --nproc_per_node=4 train.py     --outdir=training-runs     --data=./data/mnist     --cond=1     --arch=adm     --precond=edm     --batch=512     --duration=20     --augment=0.12 --seed=33
+torchrun     --standalone --nproc_per_node=4 train.py     --outdir=training-runs     --data=./data/mnist     --cond=1     --arch=adm     --precond=edm     --batch=512     --duration=20     --augment=0.12 --seed=85
+torchrun     --standalone --nproc_per_node=4 train.py     --outdir=training-runs     --data=./data/mnist     --cond=1     --arch=adm     --precond=edm     --batch=512     --duration=20     --augment=0.12 --seed=69
