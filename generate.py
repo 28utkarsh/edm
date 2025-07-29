@@ -5,7 +5,11 @@
 # You should have received a copy of the license along with this
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
+<<<<<<< Updated upstream
 """Generate random MNIST images and compute FID score using the techniques described in the paper
+=======
+"""Generate random MNIST images and compute FID score and Sliced Wasserstein Distance using the techniques described in the paper
+>>>>>>> Stashed changes
 "Elucidating the Design Space of Diffusion-Based Generative Models"."""
 
 import os
@@ -23,6 +27,10 @@ from pytorch_fid import fid_score
 from pytorch_fid.inception import InceptionV3
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
+<<<<<<< Updated upstream
+=======
+import ot
+>>>>>>> Stashed changes
 
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
@@ -200,6 +208,47 @@ class StackedRandomGenerator:
         return torch.stack([torch.randint(*args, size=size[1:], generator=gen, **kwargs) for gen in self.generators])
 
 #----------------------------------------------------------------------------
+<<<<<<< Updated upstream
+=======
+# Compute Sliced Wasserstein Distance
+
+def compute_sliced_wasserstein_distance(x: np.ndarray, y: np.ndarray, n_projections: int = 1000) -> float:
+    """
+    Compute the sliced Wasserstein distance between two sets of samples.
+    
+    Args:
+        x (np.ndarray): First set of samples, shape (n_samples, n_features)
+        y (np.ndarray): Second set of samples, shape (n_samples, n_features)
+        n_projections (int): Number of random projections to use
+    
+    Returns:
+        float: Sliced Wasserstein distance
+    """
+    n = x.shape[0]
+    m = y.shape[0]
+    d = x.shape[1]
+    a = np.ones(n) / n
+    b = np.ones(m) / m
+    
+    # Subsample to make computation faster
+    n_samples = min(1000, min(n, m))
+    x_subset = x[np.random.choice(n, n_samples, replace=False)]
+    y_subset = y[np.random.choice(m, n_samples, replace=False)]
+    
+    # Generate random projections
+    projections = np.random.randn(n_projections, d)
+    projections /= np.sqrt(np.sum(projections**2, axis=1, keepdims=True))
+    
+    sw_distance = 0.0
+    for proj in projections:
+        x_proj = np.dot(x_subset, proj)
+        y_proj = np.dot(y_subset, proj)
+        sw_distance += ot.emd2(a[:n_samples], b[:n_samples], ot.dist(x_proj.reshape(-1, 1), y_proj.reshape(-1, 1)))
+    
+    return sw_distance / n_projections
+
+#----------------------------------------------------------------------------
+>>>>>>> Stashed changes
 # FID computation using pytorch-fid library
 
 def compute_fid_pytorch_fid(original_images, generated_images, batch_size=50, device='cuda' if torch.cuda.is_available() else 'cpu', dims=2048):
@@ -272,8 +321,14 @@ def compute_fid_pytorch_fid(original_images, generated_images, batch_size=50, de
 def load_true_mnist_samples(n_samples=1000):
     """Load true MNIST samples."""
     transform = transforms.Compose([
+<<<<<<< Updated upstream
         transforms.ToTensor(),  # Converts to [0, 1]
         transforms.Lambda(lambda x: x.view(-1))  # Flatten to [784]
+=======
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,)),
+        transforms.Lambda(lambda x: x.view(-1))
+>>>>>>> Stashed changes
     ])
     dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
     indices = np.random.choice(len(dataset), size=n_samples, replace=False)
@@ -320,13 +375,21 @@ def parse_int_list(s):
 @click.option('--n-samples',               help='Number of true samples for metrics', metavar='INT', type=click.IntRange(min=1), default=1000, show_default=True)
 
 def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, n_samples, **sampler_kwargs):
+<<<<<<< Updated upstream
     """Generate random MNIST images and compute FID score using the techniques described in the paper
+=======
+    """Generate random MNIST images and compute FID score and Sliced Wasserstein Distance using the techniques described in the paper
+>>>>>>> Stashed changes
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
     Examples:
 
     \b
+<<<<<<< Updated upstream
     # Generate 1000 MNIST images and compute FID
+=======
+    # Generate 1000 MNIST images and compute FID and Sliced Wasserstein Distance
+>>>>>>> Stashed changes
     torchrun --standalone --nproc_per_node=1 generate.py --outdir=generated-samples \\
         --network=training-runs/00023-mnist-uncond-ddpmpp-edm-gpus1-batch2048-fp32/network-snapshot-002000.pkl \\
         --seeds=0-999 --batch=64 --steps=40 --n-samples=1000
@@ -347,8 +410,13 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, n_sampl
     with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
         net = pickle.load(f)['ema'].to(device)
 
+<<<<<<< Updated upstream
     # Load true MNIST samples for FID.
     dist.print0(f'Loading true MNIST samples for FID...')
+=======
+    # Load true MNIST samples for FID and Sliced Wasserstein.
+    dist.print0(f'Loading true MNIST samples for metrics...')
+>>>>>>> Stashed changes
     true_samples = load_true_mnist_samples(n_samples=n_samples).to(device)  # [n_samples, 784]
 
     # Other ranks follow.
@@ -356,7 +424,11 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, n_sampl
         torch.distributed.barrier()
 
     # Initialize metrics storage.
+<<<<<<< Updated upstream
     metrics = {'fid': []}
+=======
+    metrics = {'fid': [], 'sliced_wasserstein': []}
+>>>>>>> Stashed changes
 
     # Loop over batches.
     dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
@@ -383,7 +455,11 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, n_sampl
         sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
         samples = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
 
+<<<<<<< Updated upstream
         # Convert samples to numpy for saving and FID.
+=======
+        # Convert samples to numpy for saving and metrics.
+>>>>>>> Stashed changes
         samples_np = samples.to(torch.float32).cpu().numpy()  # [batch, 1, 28, 28]
         samples_flat = samples_np.reshape(batch_size, -1)  # [batch, 784]
         generated_samples.append(samples_flat)
@@ -397,6 +473,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, n_sampl
                 image_path = os.path.join(output_dir, f'{seed:06d}.png')
                 PIL.Image.fromarray(image_np[:, :, 0], 'L').save(image_path)
 
+<<<<<<< Updated upstream
     # Compute FID (only on rank 0).
     if dist.get_rank() == 0:
         generated_samples = np.concatenate(generated_samples, axis=0)  # [n_total, 784]
@@ -405,6 +482,26 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, n_sampl
 
         # Save metrics.
         metrics_avg = {'fid': float(np.mean(metrics['fid']))}
+=======
+    # Compute metrics (only on rank 0).
+    if dist.get_rank() == 0:
+        generated_samples = np.concatenate(generated_samples, axis=0)  # [n_total, 784]
+        true_samples_np = true_samples.cpu().numpy()
+
+        # Compute FID
+        fid = compute_fid_pytorch_fid(true_samples_np, generated_samples, batch_size=max_batch_size, device=device)
+        metrics['fid'].append(fid)
+
+        # Compute Sliced Wasserstein Distance
+        sw_distance = compute_sliced_wasserstein_distance(true_samples_np, generated_samples, n_projections=1000)
+        metrics['sliced_wasserstein'].append(sw_distance)
+
+        # Save metrics.
+        metrics_avg = {
+            'fid': float(np.mean(metrics['fid'])),
+            'sliced_wasserstein': float(np.mean(metrics['sliced_wasserstein']))
+        }
+>>>>>>> Stashed changes
         with open(os.path.join(outdir, 'metrics.json'), 'w') as f:
             json.dump(metrics_avg, f, indent=2)
         dist.print0(f'Metrics: {metrics_avg}')
